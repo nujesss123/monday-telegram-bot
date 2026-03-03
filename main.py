@@ -13,6 +13,7 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 MONDAY_API_KEY = os.getenv("MONDAY_API_KEY")
+MONDAY_MY_USER_ID = os.getenv("MONDAY_MY_USER_ID", "29084552")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_SECONDS", "120"))  # 기본 2분
 
 KST = timezone(timedelta(hours=9))
@@ -86,9 +87,18 @@ async def fetch_activity_logs(from_time: str) -> list:
         return events
 
 
+def is_mentioned_me(log: dict) -> bool:
+    """create_update 이벤트에서 내 user ID가 포함된 경우만 True"""
+    if log.get("event") != "create_update":
+        return False
+    data_raw = log.get("data") or ""
+    if not isinstance(data_raw, str):
+        data_raw = json.dumps(data_raw)
+    return MONDAY_MY_USER_ID in data_raw
+
+
 def format_activity_log(log: dict) -> str:
     board_name = log.get("board_name", "알 수 없는 보드")
-    event = log.get("event", "unknown")
     created_at = log.get("created_at", "")
 
     # data 파싱
@@ -111,27 +121,13 @@ def format_activity_log(log: dict) -> str:
         except Exception:
             time_str = created_at[:16]
 
-    # 이벤트 종류별 메시지
-    event_map = {
-        "create_pulse": "✅ 새 아이템 생성",
-        "update_column_value": "✏️ 컬럼 값 변경",
-        "change_column_value": "✏️ 컬럼 값 변경",
-        "update_name": "🔄 아이템 이름 변경",
-        "create_update": "💬 업데이트(댓글) 작성",
-        "delete_pulse": "🗑 아이템 삭제",
-        "move_pulse_into_board": "➡️ 아이템 이동",
-        "due_date_changed": "📅 마감일 변경",
-        "archive_pulse": "📦 아이템 보관",
-    }
-    event_text = event_map.get(event, f"🔔 {event}")
-
-    msg = "📋 <b>Monday.com 알림</b>\n"
+    msg = "📋 <b>Monday.com 멘션 알림</b>\n"
     msg += f"🗂 보드: {board_name}\n"
     if group_name:
         msg += f"📁 그룹: {group_name}\n"
     if pulse_name:
         msg += f"📌 아이템: <b>{pulse_name}</b>\n"
-    msg += f"{event_text}"
+    msg += "💬 댓글에서 멘션됨"
     if time_str:
         msg += f"\n🕐 {time_str}"
 
@@ -161,6 +157,8 @@ async def polling_loop():
                 log_id = log.get("id")
                 if log_id and log_id not in seen_event_ids:
                     seen_event_ids.add(log_id)
+                    if not is_mentioned_me(log):
+                        continue
                     msg = format_activity_log(log)
                     await send_telegram(msg)
                     new_count += 1
