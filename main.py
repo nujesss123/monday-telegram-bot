@@ -1,17 +1,27 @@
 import os
+import json
+import asyncio
+from datetime import datetime, timezone, timedelta
+from contextlib import asynccontextmanager
+
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 from dotenv import load_dotenv
 
 load_dotenv()
 
-app = FastAPI(title="Monday.com → Telegram Bot")
-
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+MONDAY_API_KEY = os.getenv("MONDAY_API_KEY")
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_SECONDS", "120"))  # 기본 2분
+
+KST = timezone(timedelta(hours=9))
+
+# 이미 전송한 이벤트 ID 추적 (중복 방지)
+seen_event_ids: set = set()
 
 
-# ─── Telegram 전송 ──────────────────────────────────────────────────────────────
+# ─── Telegram 전송 ────────────────────────────────────────────────────────────
 
 async def send_telegram(message: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -19,105 +29,169 @@ async def send_telegram(message: str):
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML",
-    }
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
     async with httpx.AsyncClient() as client:
         resp = await client.post(url, json=payload, timeout=10)
         if resp.status_code != 200:
             print(f"[ERROR] Telegram 전송 실패: {resp.text}")
 
 
-# ─── 이벤트 메시지 포맷터 ────────────────────────────────────────────────────────
+# ─── Monday.com API 폴링 ──────────────────────────────────────────────────────
 
-def format_event(event: dict) -> str:
-    event_type = event.get("type", "unknown")
-    board_name = event.get("boardName", "알 수 없는 보드")
-    pulse_name = event.get("pulseName", "알 수 없는 아이템")
-    user_id = event.get("userId", "")
-    group_name = event.get("groupName", "")
+async def fetch_activity_logs(from_time: str) -> list:
+    query = """
+    query ($from: ISO8601DateTime!) {
+      boards(limit: 100) {
+        id
+        name
+        activity_logs(limit: 30, from: $from) {
+          id
+          event
+          created_at
+          data
+          user_id
+        }
+      }
+    }
+    """
+    headers = {
+        "Authorization": MONDAY_API_KEY,
+        "Content-Type": "application/json",
+        "API-Version": "2024-01",
+    }
+    payload = {"query": query, "variables": {"from": from_time}}
 
-    header = f"📋 <b>Monday.com 알림</b>\n"
-    board_line = f"🗂 보드: {board_name}\n"
-    item_line = f"📌 아이템: <b>{pulse_name}</b>\n"
-    group_line = f"📁 그룹: {group_name}\n" if group_name else ""
-
-    # 이벤트 유형별 메시지
-    if event_type == "create_pulse":
-        detail = "✅ 새 아이템이 생성되었습니다."
-
-    elif event_type == "update_column_value":
-        col_title = event.get("columnTitle", "")
-        new_val = _extract_value(event.get("value", {}))
-        prev_val = _extract_value(event.get("previousValue", {}))
-        detail = (
-            f"✏️ <b>{col_title}</b> 컬럼이 변경되었습니다.\n"
-            f"   이전: {prev_val}\n"
-            f"   이후: {new_val}"
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            "https://api.monday.com/v2",
+            json=payload,
+            headers=headers,
+            timeout=30,
         )
+        if resp.status_code != 200:
+            print(f"[ERROR] Monday API 오류: {resp.status_code} {resp.text}")
+            return []
 
-    elif event_type == "update_name":
-        prev_name = event.get("previousValue", {}).get("name", "")
-        detail = f"🔄 아이템 이름 변경: {prev_name} → {pulse_name}"
+        data = resp.json()
+        if "errors" in data:
+            print(f"[ERROR] Monday API GraphQL 오류: {data['errors']}")
+            return []
 
-    elif event_type == "create_update":
-        body = event.get("body", "")
-        detail = f"💬 새 업데이트가 작성되었습니다:\n<i>{body[:300]}</i>"
-
-    elif event_type == "delete_pulse":
-        detail = "🗑 아이템이 삭제되었습니다."
-
-    elif event_type == "due_date_changed":
-        new_date = event.get("value", {}).get("date", "")
-        prev_date = event.get("previousValue", {}).get("date", "")
-        detail = (
-            f"📅 마감일 변경\n"
-            f"   이전: {prev_date or '없음'}\n"
-            f"   이후: {new_date or '없음'}"
-        )
-
-    elif event_type == "move_pulse_into_board":
-        detail = "➡️ 아이템이 보드로 이동되었습니다."
-
-    elif event_type == "change_column_value":
-        col_title = event.get("columnTitle", "")
-        new_val = _extract_value(event.get("value", {}))
-        detail = f"✏️ <b>{col_title}</b> → {new_val}"
-
-    else:
-        detail = f"🔔 이벤트: {event_type}"
-
-    user_line = f"\n👤 사용자 ID: {user_id}" if user_id else ""
-
-    return header + board_line + group_line + item_line + detail + user_line
+        boards = data.get("data", {}).get("boards", [])
+        events = []
+        for board in boards:
+            for log in board.get("activity_logs", []):
+                log["board_name"] = board.get("name", "")
+                events.append(log)
+        return events
 
 
-def _extract_value(val: dict) -> str:
-    if not val:
-        return "없음"
-    # 상태(status) 컬럼
-    if "label" in val:
-        return val["label"].get("text", str(val))
-    # 날짜
-    if "date" in val:
-        return val["date"] or "없음"
-    # 텍스트
-    if "text" in val:
-        return val["text"] or "없음"
-    # 숫자
-    if "number" in val:
-        return str(val["number"])
-    # 사람 배정
-    if "personsAndTeams" in val:
-        persons = val["personsAndTeams"]
-        names = [str(p.get("id", "")) for p in persons]
-        return ", ".join(names) if names else "없음"
-    return str(val)
+def format_activity_log(log: dict) -> str:
+    board_name = log.get("board_name", "알 수 없는 보드")
+    event = log.get("event", "unknown")
+    created_at = log.get("created_at", "")
+
+    # data 파싱
+    data_raw = log.get("data", "{}")
+    try:
+        data = json.loads(data_raw) if isinstance(data_raw, str) else (data_raw or {})
+    except Exception:
+        data = {}
+
+    pulse_name = data.get("pulse_name", data.get("item_name", ""))
+    group_name = data.get("group_name", "")
+
+    # 시간 → 한국 시간
+    time_str = ""
+    if created_at:
+        try:
+            dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+            dt_kst = dt.astimezone(KST)
+            time_str = dt_kst.strftime("%m/%d %H:%M")
+        except Exception:
+            time_str = created_at[:16]
+
+    # 이벤트 종류별 메시지
+    event_map = {
+        "create_pulse": "✅ 새 아이템 생성",
+        "update_column_value": "✏️ 컬럼 값 변경",
+        "change_column_value": "✏️ 컬럼 값 변경",
+        "update_name": "🔄 아이템 이름 변경",
+        "create_update": "💬 업데이트(댓글) 작성",
+        "delete_pulse": "🗑 아이템 삭제",
+        "move_pulse_into_board": "➡️ 아이템 이동",
+        "due_date_changed": "📅 마감일 변경",
+        "archive_pulse": "📦 아이템 보관",
+    }
+    event_text = event_map.get(event, f"🔔 {event}")
+
+    msg = "📋 <b>Monday.com 알림</b>\n"
+    msg += f"🗂 보드: {board_name}\n"
+    if group_name:
+        msg += f"📁 그룹: {group_name}\n"
+    if pulse_name:
+        msg += f"📌 아이템: <b>{pulse_name}</b>\n"
+    msg += f"{event_text}"
+    if time_str:
+        msg += f"\n🕐 {time_str}"
+
+    return msg
 
 
-# ─── 웹훅 엔드포인트 ─────────────────────────────────────────────────────────────
+async def polling_loop():
+    if not MONDAY_API_KEY:
+        print("[INFO] MONDAY_API_KEY 없음 — Webhook 모드만 동작합니다.")
+        return
+
+    print(f"[INFO] Monday.com 폴링 시작 (간격: {POLL_INTERVAL}초)")
+
+    # 서버 시작 시점부터 추적 (이전 이벤트 스킵)
+    last_check = datetime.now(timezone.utc)
+
+    while True:
+        await asyncio.sleep(POLL_INTERVAL)
+        try:
+            from_time = last_check.strftime("%Y-%m-%dT%H:%M:%SZ")
+            new_last_check = datetime.now(timezone.utc)
+
+            logs = await fetch_activity_logs(from_time)
+
+            new_count = 0
+            for log in logs:
+                log_id = log.get("id")
+                if log_id and log_id not in seen_event_ids:
+                    seen_event_ids.add(log_id)
+                    msg = format_activity_log(log)
+                    await send_telegram(msg)
+                    new_count += 1
+                    await asyncio.sleep(0.3)  # Telegram rate limit 방지
+
+            if new_count:
+                print(f"[INFO] {new_count}개 새 이벤트 전송")
+
+            last_check = new_last_check
+
+        except Exception as e:
+            print(f"[ERROR] 폴링 오류: {e}")
+
+
+# ─── Lifespan ─────────────────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(polling_loop())
+    yield
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+app = FastAPI(title="Monday.com → Telegram Bot", lifespan=lifespan)
+
+
+# ─── Webhook 엔드포인트 (보조용) ──────────────────────────────────────────────
 
 @app.post("/webhook/monday")
 async def monday_webhook(request: Request):
@@ -126,17 +200,26 @@ async def monday_webhook(request: Request):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    # Monday.com 웹훅 인증 챌린지 응답
     if "challenge" in body:
         return {"challenge": body["challenge"]}
 
     event = body.get("event")
     if not event:
-        return {"status": "ignored", "reason": "no event"}
+        return {"status": "ignored"}
 
-    message = format_event(event)
-    await send_telegram(message)
+    # Webhook 이벤트도 포맷해서 전송
+    event_type = event.get("type", "unknown")
+    board_name = event.get("boardName", "")
+    pulse_name = event.get("pulseName", "")
 
+    msg = "📋 <b>Monday.com 알림 (Webhook)</b>\n"
+    if board_name:
+        msg += f"🗂 보드: {board_name}\n"
+    if pulse_name:
+        msg += f"📌 아이템: <b>{pulse_name}</b>\n"
+    msg += f"🔔 이벤트: {event_type}"
+
+    await send_telegram(msg)
     return {"status": "ok"}
 
 
