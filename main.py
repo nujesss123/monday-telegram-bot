@@ -80,7 +80,7 @@ async def fetch_activity_logs(from_time: str) -> list:
         boards = data.get("data", {}).get("boards", [])
         events = []
         for board in boards:
-            for log in board.get("activity_logs", []):
+            for log in (board.get("activity_logs") or []):
                 log["board_name"] = board.get("name", "")
                 events.append(log)
         return events
